@@ -1,24 +1,23 @@
-# vim: ft=yaml
 version: '3.9'
 
 services:
 
   postgresql:
-    image: bitnami/postgresql:${POSTGRES_VERSION}
+    image: bitnami/postgresql:17.2.0
+    environment:
+      POSTGRES_PASSWORD: "31695d7b59ea0665ee62"
     volumes:
       - pgdata:/bitnami/postgresql
     networks:
       openreplay-net:
         aliases:
           - postgresql.db.svc.cluster.local
-    environment:
-      POSTGRESQL_PASSWORD: "${COMMON_PG_PASSWORD}"
     deploy:
       restart_policy:
         condition: on-failure
 
   clickhouse:
-    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}
+    image: clickhouse/clickhouse-server:25.1-alpine
     volumes:
       - clickhouse:/var/lib/clickhouse
     networks:
@@ -26,7 +25,7 @@ services:
         aliases:
           - clickhouse-openreplay-clickhouse.db.svc.cluster.local
     environment:
-      CLICKHOUSE_USER: "default"
+      CLICKHOUSE_USER: default
       CLICKHOUSE_PASSWORD: ""
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     deploy:
@@ -34,23 +33,23 @@ services:
         condition: on-failure
 
   redis:
-    image: bitnami/redis:${REDIS_VERSION}
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
     volumes:
-      - redisdata:/bitnami/redis/data
+      - redisdata:/data
     networks:
       openreplay-net:
         aliases:
           - redis-master.db.svc.cluster.local
-    environment:
-      ALLOW_EMPTY_PASSWORD: "yes"
     deploy:
       restart_policy:
         condition: on-failure
 
   minio:
-    image: bitnami/minio:${MINIO_VERSION}
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
     volumes:
-      - miniodata:/bitnami/minio/data
+      - miniodata:/data
     networks:
       openreplay-net:
         aliases:
@@ -67,46 +66,13 @@ services:
       restart_policy:
         condition: on-failure
 
-  fs-permission:
-    image: debian:stable-slim
-    volumes:
-      - shared-volume:/mnt/efs
-      - miniodata:/mnt/minio
-      - pgdata:/mnt/postgres
-    entrypoint: ["/bin/bash", "-c", "chown -R 1001:1001 /mnt/{efs,minio,postgres}"]
-    deploy:
-      restart_policy:
-        condition: on-failure
-
-  minio-migration:
-    image: bitnami/minio:2020.10.9-debian-10-r6
-    depends_on:
-      - minio
-      - fs-permission
-    networks:
-      - openreplay-net
-    volumes:
-      - ../helmcharts/openreplay/files/minio.sh:/tmp/minio.sh
-    environment:
-      MINIO_HOST: http://minio.db.svc.cluster.local:9000
-      MINIO_ACCESS_KEY: ${COMMON_S3_KEY}
-      MINIO_SECRET_KEY: ${COMMON_S3_SECRET}
-    user: root
-    entrypoint: >
-      /bin/bash -c "apt update && apt install netcat -y &&
-      until nc -z -v -w30 minio 9000; do
-        echo 'Waiting for Minio server to be ready...'; sleep 1;
-      done;
-      bash /tmp/minio.sh init || exit 100"
-    deploy:
-      restart_policy:
-        condition: on-failure
+  # ===== MIGRATIONS =====
 
   db-migration:
     image: bitnami/postgresql:14.5.0
     depends_on:
       - postgresql
-      - minio-migration
+      - minio
     networks:
       - openreplay-net
     volumes:
@@ -116,45 +82,36 @@ services:
       PGPORT: 5432
       PGDATABASE: postgres
       PGUSER: postgres
-      PGPASSWORD: ${COMMON_PG_PASSWORD}
+      PGPASSWORD: 31695d7b59ea0665ee62
     entrypoint: >
-      /bin/bash -c "until psql -c '\q'; do
-        echo 'PostgreSQL is unavailable - sleeping'; sleep 1;
+      sh -c "until pg_isready -h postgresql -p 5432; do
+        echo 'Postgres not ready, waiting...'; sleep 1;
       done;
-      echo 'PostgreSQL is up - executing command';
-      psql -v ON_ERROR_STOP=1 -f /tmp/init_schema.sql"
+      psql -h postgresql -U postgres -d postgres -f /tmp/init_schema.sql"
     deploy:
       restart_policy:
         condition: on-failure
 
   clickhouse-migration:
-    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}
+    image: clickhouse/clickhouse-client:25.1-alpine
     depends_on:
       - clickhouse
-      - minio-migration
+      - minio
     networks:
       - openreplay-net
     volumes:
       - ../schema/db/init_dbs/clickhouse/create/init_schema.sql:/tmp/init_schema.sql
-    environment:
-      CH_HOST: "clickhouse-openreplay-clickhouse.db.svc.cluster.local"
-      CH_PORT: "9000"
-      CH_PORT_HTTP: "8123"
-      CH_USERNAME: "default"
-      CH_PASSWORD: ""
     entrypoint: >
-      /bin/bash -c "until nc -z -v -w30 clickhouse-openreplay-clickhouse.db.svc.cluster.local 9000; do
-        echo 'Waiting for Clickhouse server to be ready...'; sleep 1;
+      sh -c "until nc -z clickhouse-openreplay-clickhouse.db.svc.cluster.local 9000; do
+        echo 'Waiting for Clickhouse...'; sleep 1;
       done;
-      echo 'Clickhouse is up - executing command';
-      clickhouse-client -h clickhouse-openreplay-clickhouse.db.svc.cluster.local --user default --port 9000 --multiquery < /tmp/init_schema.sql || true"
+      clickhouse-client -h clickhouse-openreplay-clickhouse.db.svc.cluster.local --multiquery < /tmp/init_schema.sql || true"
     deploy:
       restart_policy:
         condition: on-failure
 
-  # === App Services ===
   alerts-openreplay:
-    image: public.ecr.aws/p1t3u8a3/alerts:${COMMON_VERSION}
+    image: public.ecr.aws/p1t3u8a3/alerts:v1.22.0
     networks:
       openreplay-net:
         aliases:
@@ -169,7 +126,7 @@ services:
         condition: any
 
   analytics-openreplay:
-    image: public.ecr.aws/p1t3u8a3/analytics:${COMMON_VERSION}
+    image: public.ecr.aws/p1t3u8a3/analytics:v1.22.0
     networks:
       openreplay-net:
         aliases:
@@ -183,7 +140,259 @@ services:
       restart_policy:
         condition: any
 
-  # (...) Repete o mesmo padrão para os outros serviços openreplay
+  http-openreplay:
+    image: public.ecr.aws/p1t3u8a3/http:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - http-openreplay
+          - http-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/http.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+
+  
+  
+  images-openreplay:
+    image: public.ecr.aws/p1t3u8a3/images:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - images-openreplay
+          - images-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/images.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  integrations-openreplay:
+    image: public.ecr.aws/p1t3u8a3/integrations:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - integrations-openreplay
+          - integrations-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/integrations.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  sink-openreplay:
+    image: public.ecr.aws/p1t3u8a3/sink:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - sink-openreplay
+          - sink-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/sink.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  sourcemapreader-openreplay:
+    image: public.ecr.aws/p1t3u8a3/sourcemapreader:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - sourcemapreader-openreplay
+          - sourcemapreader-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/sourcemapreader.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  spot-openreplay:
+    image: public.ecr.aws/p1t3u8a3/spot:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - spot-openreplay
+          - spot-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/spot.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  storage-openreplay:
+    image: public.ecr.aws/p1t3u8a3/storage:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - storage-openreplay
+          - storage-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/storage.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  assets-openreplay:
+    image: public.ecr.aws/p1t3u8a3/assets:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - assets-openreplay
+          - assets-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/assets.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  assist-openreplay:
+    image: public.ecr.aws/p1t3u8a3/assist:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - assist-openreplay
+          - assist-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/assist.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  canvases-openreplay:
+    image: public.ecr.aws/p1t3u8a3/canvases:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - canvases-openreplay
+          - canvases-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/canvases.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  chalice-openreplay:
+    image: public.ecr.aws/p1t3u8a3/chalice:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - chalice-openreplay
+          - chalice-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/chalice.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any    
+  
+  db-openreplay:
+    image: public.ecr.aws/p1t3u8a3/db:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - db-openreplay
+          - db-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/db.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  ender-openreplay:
+    image: public.ecr.aws/p1t3u8a3/ender:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - ender-openreplay
+          - ender-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/ender.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  frontend-openreplay:
+    image: public.ecr.aws/p1t3u8a3/frontend:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - frontend-openreplay
+          - frontend-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/frontend.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
+  
+  
+  heuristics-openreplay:
+    image: public.ecr.aws/p1t3u8a3/heuristics:v1.22.0
+    networks:
+      openreplay-net:
+        aliases:
+          - heuristics-openreplay
+          - heuristics-openreplay.app.svc.cluster.local
+    volumes:
+      - shared-volume:/mnt/efs
+    env_file:
+      - docker-envs/heuristics.env
+    environment: {}  # Fallback empty environment if env_file is missing
+    deploy:
+      restart_policy:
+        condition: any
 
   nginx-openreplay:
     image: nginx:latest
@@ -214,7 +423,7 @@ services:
       - openreplay-net
     environment:
       - ACME_AGREE=true
-      - CADDY_DOMAIN=${CADDY_DOMAIN}
+      - CADDY_DOMAIN=open.eltech.cloud
     deploy:
       restart_policy:
         condition: any
